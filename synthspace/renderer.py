@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+from pathlib import Path
 
 import math
 import os
@@ -17,11 +18,340 @@ from visnav.render.render import RenderEngine
 from visnav.testloop import TestLoop
 
 
-"""
-Open questions:
-    - what coordinate system(s) is/are used?
-    - what object format is used?
-"""
+class RenderControllerError(RuntimeError):
+    """Generic error for RenderController."""
+    pass
+
+
+class RenderAbstractObject:
+    def __init__(self, name):
+        self.name = name
+        self._dirty = True
+
+    def is_dirty(self):
+        return self._dirty
+
+    def set_dirty(self):
+        self._dirty = True
+
+    def clear_dirty(self):
+        self._dirty = False
+
+
+class RenderCamera(RenderAbstractObject):
+    DEFAULTS = {
+        'f_stop': 2.2,
+        'emp_coef': 1/100,          # attenuating filter, similar like on Rosetta NavCam
+        'quantum_eff': 0.5,
+        'px_saturation_e': 13.5e3,
+        'lambda_min': 350e-9,
+        'lambda_eff': 580e-9,
+        'lambda_max': 800e-9,
+        'dark_noise_mu': 110,
+        'readout_noise_sd': 15,
+        'point_spread_fn': 0.5,
+        'scattering_coef': 2e-9,
+        'exclusion_angle_x': 45,
+        'exclusion_angle_y': 45,
+    }
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.model = None
+        self.exposure = 1
+        self.gain = 1
+        self.loc = None
+        self.q = None
+        self.target_axis = (0, 0, -1)           # camera boresight
+        self.target_axis_up = (0, 1, 0)         # up direction of camera boresight
+        self.target = None                      # target object
+        self.target_up = (0, 1, 0)              # target up direction
+
+        self.focal_length = None
+        self.sensor_width = None
+        self.frustum_near = None
+        self.frustum_far = None
+        self.extra = None
+
+    def conf(self, lens, sensor, clip_start, clip_end, **extra):
+        self.set_dirty()
+        self.focal_length = lens
+        self.sensor_width = sensor
+        self.frustum_near = clip_start
+        self.frustum_far = clip_end
+        self.extra = extra
+
+    def is_dirty(self):
+        return super().is_dirty() or self.model is None
+
+    def prepare(self, scene):
+        w, h = scene.width, scene.height
+
+        if self.target is not None:
+            # change orientation so that target is on the camera bore-sight
+            self._update_target()
+
+        if self.is_dirty() or self.model.width != w or self.model.height != h:
+            x_fov = math.degrees(2 * math.atan(self.sensor_width/2/self.focal_length))
+            y_fov = x_fov * h/w
+            params = RenderCamera.DEFAULTS.copy()
+            params.update(self.extra)
+            if 'aperture' in params:
+                params.pop('f_stop', False)
+            if 'px_saturation_e' not in self.extra:
+                params['px_saturation_e'] *= ((self.sensor_width/w)/5.5e-3)**2
+            if 'dark_noise_mu' not in self.extra:
+                params['dark_noise_mu'] *= params['px_saturation_e']/self.DEFAULTS['px_saturation_e']
+            if 'dark_noise_sd' not in self.extra:
+                params['dark_noise_sd'] = np.sqrt(params['dark_noise_mu'])
+
+            self.model = Camera(w, h, x_fov, y_fov, focal_length=self.focal_length, **params)
+            self.clear_dirty()
+
+    def _check_params(self):
+        assert self.loc is not None, 'Location not set for camera %s' % self.name
+        assert self.q is not None or self.target is not None, 'Orientation or target is not set for camera %s' % self.name
+        assert self.focal_length is not None, 'Camera %s not configured' % self.name
+        assert self.sensor_width is not None, 'Camera %s not configured' % self.name
+        assert self.frustum_near is not None, 'Camera %s not configured' % self.name
+        assert self.frustum_far is not None, 'Camera %s not configured' % self.name
+
+    def _update_target(self):
+        """
+        Change camera orientation so that target is on the camera bore-sight defined by target_axis vector.
+        Additional constraint is needed for unique final rotation, this can be provided by target_up vector.
+        """
+        boresight = np.array(self.target_axis)
+        loc = self.target.loc - self.loc
+        axis = np.cross(boresight, loc)
+        angle = tools.angle_between_v(boresight, loc)
+        q = tools.angleaxis_to_q((angle,) + tuple(axis))
+
+        # if up target given, use it
+        if self.target_up is not None:
+            current_up = tools.q_times_v(q, np.array(self.target_axis_up))
+            target_up = np.array(self.target_up)
+
+            # project target_up on camera bore-sight, then remove the projection from target_up to get
+            # it projected on a plane perpendicular to the bore-sight
+            target_up_proj = target_up - np.dot(target_up, loc) * loc / np.dot(loc, loc)
+            if np.linalg.norm(target_up_proj) > 0:
+                axis = np.cross(target_up_proj, current_up)
+                angle = tools.angle_between_v(current_up, target_up_proj)
+                q = tools.angleaxis_to_q((angle,) + tuple(axis)) * q
+
+        self.q = q
+
+
+class RenderObject(RenderAbstractObject):
+    HAPKE_PARAMS = ChuryumovGerasimenko.HAPKE_PARAMS
+
+    def __init__(self, name, data):
+        super().__init__(name)
+        self.model = data
+        self.clear_dirty()
+        self.rotation_mode = None   # not used
+        self.loc = None
+        self.q = None
+
+    @property
+    def location(self):
+        return tuple(self.loc)
+
+    @location.setter
+    def location(self, value):
+        self.loc = np.array(value)
+
+    @property
+    def rotation_axis_angle(self):
+        return tuple(tools.q_to_angleaxis(self.q)) if self.q else None
+
+    @rotation_axis_angle.setter
+    def rotation_axis_angle(self, angleaxis):
+        self.q = tools.angleaxis_to_q(angleaxis)
+
+    @property
+    def rotation_angleaxis(self):                       # better name as angle given first, then axis
+        return tuple(tools.q_to_angleaxis(self.q)) if self.q else None
+
+    @rotation_angleaxis.setter
+    def rotation_angleaxis(self, angleaxis):            # better name as angle given first, then axis
+        self.q = tools.angleaxis_to_q(angleaxis)
+
+    def prepare(self, scene):
+        self._check_params()
+        if self.is_dirty():
+            # seems no need to do any preparations before rendering
+            self.clear_dirty()
+
+    def _check_params(self):
+        assert self.loc is not None, 'Location not set for object %s' % self.name
+        assert self.q is not None, 'Orientation not set for object %s' % self.name
+
+
+class RenderScene(RenderAbstractObject):
+    STAR_DB_URL = 'https://drive.google.com/uc?authuser=0&id=1-_7KAMKc4Xio0RbpiVWmcPSNyuuN8Z2b&export=download'
+    STAR_DB = Path(os.path.join(os.path.dirname(__file__), '..', 'data', 'deep_space_objects.sqlite'))
+
+    def __init__(self, name, render_dir, stars=True, lens_effects=False, flux_only=False, normalize=False,
+                 hapke_params=RenderObject.HAPKE_PARAMS, verbose=True, debug=False):
+
+        super().__init__(name)
+        self._samples = 1
+        self._width = None
+        self._height = None
+
+        self._render_dir = str(render_dir)
+        self._file_format = None
+        self._color_depth = None
+        self._use_preview = None
+
+        self._cams = {}
+        self._objs = {}
+        self._sun_loc = None
+        self._renderer = None
+
+        self.object_scale = 1000   # objects given in km, locations expected in meters
+        self.flux_only = flux_only
+        self.normalize = normalize
+        self.stars = stars
+        self.lens_effects = lens_effects
+        self.hapke_params = hapke_params
+        self.verbose = verbose
+        self.debug = debug
+
+    @property
+    def width(self):
+        return self._width
+
+    @property
+    def height(self):
+        return self._height
+
+    def is_dirty(self):
+        return super().is_dirty() or np.any([i is None for i, o in self._objs.values()])
+
+    def prepare(self):
+        self._check_params()
+
+        if self.is_dirty():
+            if self._renderer is not None:
+                del self._renderer
+
+            self._renderer = RenderEngine(self._width, self._height, antialias_samples=self._samples)
+            if self.verbose:
+                print('loading objects to engine...', end='', flush=True)
+
+            for name, (_, obj) in self._objs.items():
+                idx = self._renderer.load_object(obj.model)
+                self._objs[name][0] = idx
+
+            self.clear_dirty()
+            if self.verbose:
+                print('done')
+        if self.stars:
+            if not os.path.exists(RenderScene.STAR_DB):
+                if self.verbose:
+                    print('downloading star catalog...', end='', flush=True)
+                RenderController.download_file(RenderScene.STAR_DB_URL, RenderScene.STAR_DB)
+                if self.verbose:
+                    print('done')
+
+    def render(self, name_suffix):
+        self.prepare()
+        for i, o in self._objs.values():
+            o.prepare(self)
+        for c in self._cams.values():
+            c.prepare(self)
+
+        sun_sc_v = np.mean(np.array([o.loc - self._sun_loc for _, o in self._objs.values()]).reshape((-1, 3)), axis=0)
+        sun_distance = np.linalg.norm(sun_sc_v)
+        obj_idxs = [i for i, o in self._objs.values()]
+
+        for cam_name, c in self._cams.items():
+            rel_pos_v = {}
+            rel_rot_q = {}
+            for i, o in self._objs.values():
+                rel_pos_v[i] = tools.q_times_v(c.q.conj(), o.loc - c.loc)
+                rel_rot_q[i] = c.q.conj() * o.q
+
+            # make sure correct order, correct scale
+            rel_pos_v = [rel_pos_v[i]/self.object_scale for i in obj_idxs]
+            rel_rot_q = [rel_rot_q[i] for i in obj_idxs]
+            light_v = tools.q_times_v(c.q.conj(), tools.normalize_v(sun_sc_v))
+
+            self._renderer.set_frustum(c.model.x_fov, c.model.y_fov, c.frustum_near, c.frustum_far)
+            flux = TestLoop.render_navcam_image_static(None, self._renderer, obj_idxs, rel_pos_v, rel_rot_q,
+                                                       light_v, c.q, sun_distance, cam=c.model, auto_gain=False,
+                                                       use_shadows=True, use_textures=True, fluxes_only=True,
+                                                       stars=self.stars, lens_effects=self.lens_effects,
+                                                       reflmod_params=self.hapke_params, star_db=RenderScene.STAR_DB)
+
+            image = flux if self.flux_only else c.model.sense(flux, exposure=c.exposure, gain=c.gain)
+
+            if self.normalize:
+                image /= np.max(image)
+
+            if self.debug:
+                sc = 1536/image.shape[0]
+                img = cv2.resize(image, None, fx=sc, fy=sc) / (np.max(image) if self.flux_only else 1)
+                cv2.imshow('result', img)
+                cv2.waitKey()
+
+            # save image
+            self._save_img(image, cam_name, name_suffix)
+
+    def _check_params(self):
+        assert self._sun_loc is not None, 'Sun location not set for scene %s' % self.name
+        assert self._width is not None, 'Common camera resolution width not set for scene %s' % self.name
+        assert self._height is not None, 'Common camera resolution height not set for scene %s' % self.name
+        assert self._file_format is not None, 'Output file format not set for scene %s' % self.name
+        assert self._color_depth is not None, 'Output file format not set for scene %s' % self.name
+        assert self._use_preview is not None, 'Output file format not set for scene %s' % self.name
+        assert len(self._cams) > 0, 'Scene %s does not have any cameras' % self.name
+        assert len(self._objs) > 0, 'Scene %s does not have any objects' % self.name
+
+    def _save_img(self, image, cam_name, name_suffix):
+        file_ext = '.exr' if self._file_format == RenderController.FORMAT_EXR else '.png'
+        filename = os.path.join(self._render_dir, self.name + "_" + cam_name + "_" + name_suffix + file_ext)
+
+        if self._file_format == RenderController.FORMAT_PNG:
+            maxval = self._color_depth ** 2 - 1
+            image = np.clip(image * maxval, 0, maxval).astype('uint' + str(self._color_depth))
+            cv2.imwrite(filename, image)
+        else:
+            cv2.imwrite(filename, image)
+
+    def set_samples(self, samples):
+        supported = (1, 4, 9, 16)
+        assert samples in supported, '%s samples are not supported, only the following are: %s' % (samples, supported)
+        if self._samples != samples:
+            self.set_dirty()
+            self._samples = samples
+
+    def set_resolution(self, res):
+        if (self._width, self._height) != tuple(res):
+            self._width, self._height = res
+            self.set_dirty()
+            for c in self._cams.values():
+                c.set_dirty()
+
+    def set_output_format(self, file_format, color_depth, use_preview):
+        self._file_format = file_format
+        self._color_depth = color_depth
+        self._use_preview = use_preview
+
+    def link_camera(self, cam: RenderCamera):
+        self._cams[cam.name] = cam
+
+    def link_object(self, obj: RenderObject):
+        self._objs[obj.name] = [None, obj]
+
+    def set_sun_location(self, loc):
+        """
+        :param loc: sun location in meters in the same frame (e.g. asteroid/comet centric) used for camera and object locations
+        """
+        self._sun_loc = np.array(loc)
 
 
 class RenderController:
@@ -31,6 +361,8 @@ class RenderController:
         FORMAT_EXR,
         FORMAT_PNG,
     ) = range(2)
+
+    SOL = RenderObject('Sol', None)
 
     def __init__(self, render_dir, logger=None, verbose=True):
         """Initialize controller class."""
@@ -131,7 +463,7 @@ class RenderController:
 
     def set_camera_location(self, camera_name="Camera", location=(0, 0, 0), orientation=None, angleaxis=True):
         cam = self._cams[camera_name]
-        cam.loc = np.array(location)
+        cam.loc = np.array(location) if location is not None else None
         if orientation is not None:
             if len(orientation) == 4:
                 if angleaxis:
@@ -146,6 +478,7 @@ class RenderController:
         self._cams[camera_name].target = target_obj
 
     def set_sun_location(self, loc, scenes=None):
+        RenderController.SOL.location = loc
         for s in self._iter_scenes(scenes):
             s.set_sun_location(loc)
 
@@ -159,6 +492,7 @@ class RenderController:
 
     def load_object(self, filename, object_name, scenes=None):
         """Load 3d model object from file."""
+        filename = str(filename)
         assert filename[-4:].lower() == '.obj', 'only .obj files currently supported'
         if self.verbose:
             print('loading objects...', end='', flush=True)
@@ -218,323 +552,16 @@ class RenderController:
 
     @staticmethod
     def download_file(url, file, maybe=False):
+        file = str(file)
         if not maybe or not os.path.exists(file):
             import urllib
             os.makedirs(os.path.dirname(file), exist_ok=True)
             urllib.request.urlretrieve(url, file)
 
 
-class RenderControllerError(RuntimeError):
-    """Generic error for RenderController."""
-    pass
-
-
-class RenderAbstractObject:
-    def __init__(self, name):
-        self.name = name
-        self._dirty = True
-
-    def is_dirty(self):
-        return self._dirty
-
-    def set_dirty(self):
-        self._dirty = True
-
-    def clear_dirty(self):
-        self._dirty = False
-
-
-class RenderCamera(RenderAbstractObject):
-    DEFAULTS = {
-        'f_stop': 2.2,
-        'emp_coef': 1/100,          # attenuating filter, similar like on Rosetta NavCam
-        'quantum_eff': 0.5,
-        'px_saturation_e': 13.5e3,
-        'lambda_min': 350e-9,
-        'lambda_eff': 580e-9,
-        'lambda_max': 800e-9,
-        'dark_noise_mu': 110,
-        'readout_noise_sd': 15,
-        'point_spread_fn': 0.5,
-        'scattering_coef': 5e-9,
-        'exclusion_angle_x': 45,
-        'exclusion_angle_y': 45,
-    }
-
-    def __init__(self, name):
-        super().__init__(name)
-        self.model = None
-        self.exposure = 1
-        self.gain = 1
-        self.loc = None
-        self.q = None
-        self.target_axis = (0, 0, -1)           # camera boresight
-        self.target_axis_up = (0, 1, 0)         # up direction of camera boresight
-        self.target = None                      # target object
-        self.target_up = (0, 1, 0)              # target up direction
-
-        self.focal_length = None
-        self.sensor_width = None
-        self.frustum_near = None
-        self.frustum_far = None
-        self.extra = None
-
-    def conf(self, lens, sensor, clip_start, clip_end, **extra):
-        self.set_dirty()
-        self.focal_length = lens
-        self.sensor_width = sensor
-        self.frustum_near = clip_start
-        self.frustum_far = clip_end
-        self.extra = extra
-
-    def is_dirty(self):
-        return super().is_dirty() or self.model is None
-
-    def prepare(self, scene):
-        w, h = scene.width, scene.height
-
-        if self.target is not None:
-            # change orientation so that target is on the camera bore-sight
-            self._update_target()
-
-        if self.is_dirty() or self.model.width != w or self.model.height != h:
-            x_fov = math.degrees(2 * math.atan(self.sensor_width/2/self.focal_length))
-            y_fov = x_fov * h/w
-            params = RenderCamera.DEFAULTS.copy()
-            params.update(self.extra)
-            if 'aperture' in params:
-                params.pop('f_stop', False)
-            if 'px_saturation_e' not in self.extra:
-                params['px_saturation_e'] *= ((self.sensor_width/w)/5.5e-3)**2
-            if 'dark_noise_mu' not in self.extra:
-                params['dark_noise_mu'] *= params['px_saturation_e']/self.DEFAULTS['px_saturation_e']
-            if 'dark_noise_sd' not in self.extra:
-                params['dark_noise_sd'] = np.sqrt(params['dark_noise_mu'])
-
-            self.model = Camera(w, h, x_fov, y_fov, focal_length=self.focal_length, **params)
-            self.clear_dirty()
-
-    def _update_target(self):
-        """
-        Change camera orientation so that target is on the camera bore-sight defined by target_axis vector.
-        Additional constraint is needed for unique final rotation, this can be provided by target_up vector.
-        """
-        boresight = np.array(self.target_axis)
-        loc = self.target.loc - self.loc
-        axis = np.cross(boresight, loc)
-        angle = tools.angle_between_v(boresight, loc)
-        q = tools.angleaxis_to_q((angle,) + tuple(axis))
-
-        # if up target given, use it
-        if self.target_up is not None:
-            current_up = tools.q_times_v(q, np.array(self.target_axis_up))
-            target_up = np.array(self.target_up)
-
-            # project target_up on camera bore-sight, then remove the projection from target_up to get
-            # it projected on a plane perpendicular to the bore-sight
-            target_up_proj = target_up - np.dot(target_up, loc) * loc
-            if np.linalg.norm(target_up_proj) > 0:
-                axis = np.cross(current_up, target_up_proj)
-                angle = tools.angle_between_v(current_up, target_up_proj)
-                q = tools.angleaxis_to_q((angle,) + tuple(axis)) * q
-
-        self.q = q
-
-
-class RenderObject(RenderAbstractObject):
-    HAPKE_PARAMS = ChuryumovGerasimenko.HAPKE_PARAMS
-
-    def __init__(self, name, data):
-        super().__init__(name)
-        self.model = data
-        self.clear_dirty()
-        self.rotation_mode = None   # not used
-        self.loc = None
-        self.q = None
-
-    @property
-    def location(self):
-        return tuple(self.loc)
-
-    @location.setter
-    def location(self, value):
-        self.loc = np.array(value)
-
-    @property
-    def rotation_axis_angle(self):
-        return tuple(tools.q_to_angleaxis(self.q)) if self.q else None
-
-    @rotation_axis_angle.setter
-    def rotation_axis_angle(self, angleaxis):
-        self.q = tools.angleaxis_to_q(angleaxis)
-
-    @property
-    def rotation_angleaxis(self):                       # better name as angle given first, then axis
-        return tuple(tools.q_to_angleaxis(self.q)) if self.q else None
-
-    @rotation_angleaxis.setter
-    def rotation_angleaxis(self, angleaxis):            # better name as angle given first, then axis
-        self.q = tools.angleaxis_to_q(angleaxis)
-
-    def prepare(self, scene):
-        if self.is_dirty():
-            # seems no need to do any preparations before rendering
-            self.clear_dirty()
-
-
-class RenderScene(RenderAbstractObject):
-    STAR_DB_URL = 'https://drive.google.com/uc?authuser=0&id=1-_7KAMKc4Xio0RbpiVWmcPSNyuuN8Z2b&export=download'
-    STAR_DB = os.path.join(os.path.dirname(__file__), '..', 'data', 'deep_space_objects.sqlite')
-
-    def __init__(self, name, render_dir, stars=True, lens_effects=False, flux_only=False, normalize=False,
-                 hapke_params=RenderObject.HAPKE_PARAMS, verbose=True, debug=False):
-
-        super().__init__(name)
-        self._samples = 1
-        self._width = None
-        self._height = None
-
-        self._render_dir = render_dir
-        self._file_format = None
-        self._color_depth = None
-        self._use_preview = None
-
-        self._cams = {}
-        self._objs = {}
-        self._sun_loc = np.array([0, 0, 0])
-        self._renderer = None
-
-        self.flux_only = flux_only
-        self.normalize = normalize
-        self.stars = stars
-        self.lens_effects = lens_effects
-        self.hapke_params = hapke_params
-        self.verbose = verbose
-        self.debug = debug
-
-    @property
-    def width(self):
-        return self._width
-
-    @property
-    def height(self):
-        return self._height
-
-    def is_dirty(self):
-        return super().is_dirty() or np.any([i is None for i, o in self._objs.values()])
-
-    def prepare(self):
-        if self.is_dirty():
-            if self._renderer is not None:
-                del self._renderer
-
-            self._renderer = RenderEngine(self._width, self._height, antialias_samples=self._samples)
-            if self.verbose:
-                print('loading objects to engine...', end='', flush=True)
-
-            for name, (_, obj) in self._objs.items():
-                idx = self._renderer.load_object(obj.model)
-                self._objs[name][0] = idx
-
-            self.clear_dirty()
-            if self.verbose:
-                print('done')
-        if self.stars:
-            if not os.path.exists(RenderScene.STAR_DB):
-                if self.verbose:
-                    print('downloading star catalog...', end='', flush=True)
-                RenderController.download_file(RenderScene.STAR_DB_URL, RenderScene.STAR_DB)
-                if self.verbose:
-                    print('done')
-
-    def render(self, name_suffix):
-        self.prepare()
-        for i, o in self._objs.values():
-            o.prepare(self)
-        for c in self._cams.values():
-            c.prepare(self)
-
-        sun_sc_v = np.mean(np.array([o.loc - self._sun_loc for _, o in self._objs.values()]).reshape((-1, 3)), axis=0)
-        sun_distance = np.linalg.norm(sun_sc_v)
-        obj_idxs = [i for i, o in self._objs.values()]
-
-        for cam_name, c in self._cams.items():
-            rel_pos_v = {}
-            rel_rot_q = {}
-            for i, o in self._objs.values():
-                rel_pos_v[i] = o.loc - c.loc
-                rel_rot_q[i] = c.q.conj() * o.q
-
-            # make sure correct order
-            rel_pos_v = [rel_pos_v[i] for i in obj_idxs]
-            rel_rot_q = [rel_rot_q[i] for i in obj_idxs]
-            light_v = tools.q_times_v(c.q.conj(), tools.normalize_v(sun_sc_v))
-
-            self._renderer.set_frustum(c.model.x_fov, c.model.y_fov, c.frustum_near, c.frustum_far)
-            flux = TestLoop.render_navcam_image_static(None, self._renderer, obj_idxs, rel_pos_v, rel_rot_q,
-                                                       light_v, c.q, sun_distance*1e3, cam=c.model, auto_gain=False,
-                                                       use_shadows=True, use_textures=True, fluxes_only=True,
-                                                       stars=self.stars, lens_effects=self.lens_effects,
-                                                       reflmod_params=self.hapke_params, star_db=RenderScene.STAR_DB)
-
-            image = flux if self.flux_only else c.model.sense(flux, exposure=c.exposure, gain=c.gain)
-
-            if self.normalize:
-                image /= np.max(image)
-
-            if self.debug:
-                sc = 768/image.shape[0]
-                img = cv2.resize(image, None, fx=sc, fy=sc) / (np.max(image) if self.flux_only else 1)
-                cv2.imshow('result', img)
-                cv2.waitKey()
-
-            # save image
-            self._save_img(image, cam_name, name_suffix)
-
-    def _save_img(self, image, cam_name, name_suffix):
-        file_ext = '.exr' if self._file_format == RenderController.FORMAT_EXR else '.png'
-        filename = os.path.join(self._render_dir, self.name + "_" + cam_name + "_" + name_suffix + file_ext)
-
-        if self._file_format == RenderController.FORMAT_PNG:
-            maxval = self._color_depth ** 2 - 1
-            image = np.clip(image * maxval, 0, maxval).astype('uint' + str(self._color_depth))
-            cv2.imwrite(filename, image)
-        else:
-            cv2.imwrite(filename, image)
-
-    def set_samples(self, samples):
-        supported = (1, 4, 9, 16)
-        assert samples in supported, '%s samples are not supported, only the following are: %s' % (samples, supported)
-        if self._samples != samples:
-            self.set_dirty()
-            self._samples = samples
-
-    def set_resolution(self, res):
-        if (self._width, self._height) != tuple(res):
-            self._width, self._height = res
-            self.set_dirty()
-            for c in self._cams.values():
-                c.set_dirty()
-
-    def set_output_format(self, file_format, color_depth, use_preview):
-        self._file_format = file_format
-        self._color_depth = color_depth
-        self._use_preview = use_preview
-
-    def link_camera(self, cam: RenderCamera):
-        self._cams[cam.name] = cam
-
-    def link_object(self, obj: RenderObject):
-        self._objs[obj.name] = [None, obj]
-
-    def set_sun_location(self, loc):
-        """
-        :param loc: sun location in the same frame (e.g. asteroid/comet centric) used for camera and object locations
-        """
-        self._sun_loc = np.array(loc)
-
-
 if __name__ == '__main__':
+    target = ['sun', 'stars', 'sssb'][1]
+
     datapath = os.path.join(os.path.dirname(__file__), '..', 'data')
     outpath = os.path.join(os.path.dirname(__file__), '..', 'output')
     control = RenderController(outpath)
@@ -548,11 +575,11 @@ if __name__ == '__main__':
         'hapke_params': RenderObject.HAPKE_PARAMS,
     })
     control.create_camera('test_cam', scenes='test_sc')
-    control.configure_camera('test_cam', lens=20.0, sensor=5e-3*1024)
-    control.set_exposure(0.1)
+    control.configure_camera('test_cam', lens=35.0, sensor=5e-3*1024)
+    control.set_exposure(0.001 if target == 'sun' else 0.3 if target == 'sssb' else 50.0)
     control.set_resolution((1024, 1024))
     control.set_output_format('png', '8')
-    control.set_sun_location(tools.q_times_v(tools.ypr_to_q(math.radians(-90+120), 0, 0), [1.496e8, 0, 0]))
+    control.set_sun_location(tools.q_times_v(tools.ypr_to_q(math.radians(-90+120), 0, 0), [1.496e11, 0, 0]))
     control.set_camera_location('test_cam')
     objfile1, url1 = os.path.join(datapath, 'ryugu+tex-d1-16k.obj'), 'https://drive.google.com/uc?authuser=0&id=1Lu48I4nnDKYtvArUN7TnfQ4b_MhSImKM&export=download'
     objfile2, url2 = os.path.join(datapath, 'ryugu+tex-d1-16k.mtl'), 'https://drive.google.com/uc?authuser=0&id=1qf0YMbx5nIceGETqhNqePyVNZAmqNyia&export=download'
@@ -562,12 +589,17 @@ if __name__ == '__main__':
     RenderController.download_file(url3, objfile3, maybe=True)
     obj = control.load_object(os.path.join(datapath, 'ryugu+tex-d1-16k.obj'), 'ryugu-16k')
     obj.location = (0, 0, 0)
-    control.target_camera(obj, "test_cam")
+    if target == 'sun':
+        control.target_camera(control.SOL, "test_cam")
+    elif target == 'sssb':
+        control.target_camera(obj, "test_cam")
+    else:
+        control.set_camera_location("test_cam", None, (0, 1, 0, 0))
     start = datetime.datetime.now()
 
     for i in range(10):
         obj.rotation_axis_angle = (i/10 * np.pi/2, 0, 0, 1)
-        control.set_camera_location("test_cam", i * np.array([0, 0, -0.2]) + np.array([0, 0, 10]))
+        control.set_camera_location("test_cam", i * np.array([0, -500, 0]) + np.array([0, 10000, 0]))
         control.render(datetime.datetime.strftime(start + datetime.timedelta(hours=i), '%Y%m%d_%H%M%S'))
 
 
