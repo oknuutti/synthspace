@@ -389,6 +389,7 @@ class RenderController:
         """
         for s in self._iter_scenes(scenes):
             for p, v in params.items():
+                assert p in s.__dict__, "Class RenderScene does not have a property with the name '%s'" % p
                 setattr(s, p, v)
 
     def set_device(self, device="AUTO", scenes=None):
@@ -560,7 +561,7 @@ class RenderController:
 
 
 if __name__ == '__main__':
-    target = ['sun', 'stars', 'sssb'][1]
+    target = ['sun', 'stars', 'sssb'][2]
 
     datapath = os.path.join(os.path.dirname(__file__), '..', 'data')
     outpath = os.path.join(os.path.dirname(__file__), '..', 'output')
@@ -568,7 +569,7 @@ if __name__ == '__main__':
     control.create_scene('test_sc')
     control.set_scene_config({
         'debug': True,
-        'fluxes_only': False,
+        'flux_only': False,
         'normalize': False,
         'stars': True,
         'lens_effects': True,          # includes the sun
