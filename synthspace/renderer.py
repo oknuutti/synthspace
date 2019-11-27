@@ -320,7 +320,7 @@ class RenderScene(RenderAbstractObject):
             image = np.clip(image * maxval, 0, maxval).astype('uint' + str(self._color_depth))
             cv2.imwrite(filename, image)
         else:
-            cv2.imwrite(filename, image)
+            cv2.imwrite(filename, image.astype(np.float32), (cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT))
 
     def set_samples(self, samples):
         supported = (1, 4, 9, 16)
