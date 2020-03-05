@@ -13,7 +13,7 @@ setup(
     packages=find_packages(include=['synthspace*']),
 
     # Declare your packages' dependencies here, for eg:
-    install_requires=['visnav==0.1'],
+    install_requires=['visnav'],
     dependency_links=['http://github.com/oknuutti/visnav'],
 
     author='Olli Knuuttila',
