@@ -257,7 +257,7 @@ class RenderScene(RenderAbstractObject):
                 if self.verbose:
                     print('done')
 
-    def render(self, name_suffix):
+    def render(self, name_suffix):      
         self.prepare()
         for i, o in self._objs.values():
             o.prepare(self)
@@ -267,7 +267,7 @@ class RenderScene(RenderAbstractObject):
         sun_sc_v = np.mean(np.array([o.loc - self._sun_loc for _, o in self._objs.values()]).reshape((-1, 3)), axis=0)
         sun_distance = np.linalg.norm(sun_sc_v)
         obj_idxs = [i for i, o in self._objs.values()]
-
+        
         for cam_name, c in self._cams.items():
             rel_pos_v = {}
             rel_rot_q = {}
@@ -297,7 +297,7 @@ class RenderScene(RenderAbstractObject):
                 img = cv2.resize(image, None, fx=sc, fy=sc) / (np.max(image) if self.flux_only else 1)
                 cv2.imshow('result', img)
                 cv2.waitKey()
-
+            
             # save image
             self._save_img(image, cam_name, name_suffix)
 
@@ -486,10 +486,12 @@ class RenderController:
     def update(self, scenes=None):
         assert False, 'this should not be a public method'
 
-    def render(self, name_suffix=None, scenes=None):
+    def render(self, metadata, scenes=None):
         """Render given scenes."""
+        assert isinstance(metadata, dict), 'metadata dictionary needs to be given as a dictionary'
+        assert "date" in  metadata, 'metadata needs to contain a "date" field'
         for s in self._iter_scenes(scenes):
-            s.render(name_suffix)
+            s.render(metadata["date"])
 
     def load_object(self, filename, object_name, scenes=None):
         """Load 3d model object from file."""
@@ -602,5 +604,3 @@ if __name__ == '__main__':
         obj.rotation_axis_angle = (i/10 * np.pi/2, 0, 0, 1)
         control.set_camera_location("test_cam", i * np.array([0, -500, 0]) + np.array([0, 10000, 0]))
         control.render(datetime.datetime.strftime(start + datetime.timedelta(hours=i), '%Y%m%d_%H%M%S'))
-
-
