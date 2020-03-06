@@ -257,7 +257,7 @@ class RenderScene(RenderAbstractObject):
                 if self.verbose:
                     print('done')
 
-    def render(self, name_suffix):      
+    def render(self, name_suffix):
         self.prepare()
         for i, o in self._objs.values():
             o.prepare(self)
@@ -267,7 +267,7 @@ class RenderScene(RenderAbstractObject):
         sun_sc_v = np.mean(np.array([o.loc - self._sun_loc for _, o in self._objs.values()]).reshape((-1, 3)), axis=0)
         sun_distance = np.linalg.norm(sun_sc_v)
         obj_idxs = [i for i, o in self._objs.values()]
-        
+
         for cam_name, c in self._cams.items():
             rel_pos_v = {}
             rel_rot_q = {}
@@ -297,7 +297,7 @@ class RenderScene(RenderAbstractObject):
                 img = cv2.resize(image, None, fx=sc, fy=sc) / (np.max(image) if self.flux_only else 1)
                 cv2.imshow('result', img)
                 cv2.waitKey()
-            
+
             # save image
             self._save_img(image, cam_name, name_suffix)
 
