@@ -486,10 +486,12 @@ class RenderController:
     def update(self, scenes=None):
         assert False, 'this should not be a public method'
 
-    def render(self, name_suffix=None, scenes=None):
+    def render(self, metadata, scenes=None):
         """Render given scenes."""
+        assert isinstance(metadata, dict), 'metadata dictionary needs to be given as a dictionary'
+        assert "date" in  metadata, 'metadata needs to contain a "date" field'
         for s in self._iter_scenes(scenes):
-            s.render(name_suffix)
+            s.render(metadata["date"])
 
     def load_object(self, filename, object_name, scenes=None):
         """Load 3d model object from file."""
@@ -602,5 +604,3 @@ if __name__ == '__main__':
         obj.rotation_axis_angle = (i/10 * np.pi/2, 0, 0, 1)
         control.set_camera_location("test_cam", i * np.array([0, -500, 0]) + np.array([0, 10000, 0]))
         control.render(datetime.datetime.strftime(start + datetime.timedelta(hours=i), '%Y%m%d_%H%M%S'))
-
-
